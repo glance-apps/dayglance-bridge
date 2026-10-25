@@ -1,0 +1,427 @@
+// The plugin settings tab — the Obsidian-idiomatic front door for pairing.
+// The command-palette entries remain (and the offer nudge points at both),
+// but Settings → Community plugins → dayGLANCE Bridge is where users
+// expect setup to live, and this tab is that: pairing status, code entry
+// when an offer is waiting, a Sync now button, unpair (two-step), and the
+// build stamp. All flow logic is shared with the modal (submitPairingCode
+// in pairing.ts) and with the command-palette entries (the host callbacks),
+// so the entry points cannot diverge.
+
+import { Notice, PluginSettingTab, Setting, type App, type Plugin } from 'obsidian';
+import {
+  submitPairingCode,
+  readPairingOfferText,
+  type PairingHost,
+  type BridgePairing,
+} from './pairing';
+import type { AgendaKeyState, AgendaUser } from './agenda';
+import type { StalePairing } from './bridge';
+import type { EditorHidingSettings } from './editorHidingRules';
+import { normalizeScope, SCOPE_WINDOW_MIN_DAYS, SCOPE_WINDOW_MAX_DAYS, SCOPE_WINDOW_DEFAULT_DAYS, type VaultScope, normalizeProjectNoteSettings, PROJECT_NOTE_LAYOUTS, type ProjectNoteSettings } from '@glance-apps/obsidian-format';
+
+// Stamped by esbuild at bundle time (see esbuild.config.mjs `define`).
+// Guarded so a build without the define (tests, tooling) still runs.
+declare const __BUILD_TIME__: string | undefined;
+const buildTime = (): string => {
+  try {
+    if (typeof __BUILD_TIME__ === 'string') {
+      const t = Date.parse(__BUILD_TIME__);
+      if (Number.isFinite(t)) return new Date(t).toLocaleString();
+    }
+  } catch { /* fall through */ }
+  return 'unknown';
+};
+
+export interface BridgeSettingsHost extends PairingHost {
+  app: App;
+  plugin: Plugin;
+  unpair(): Promise<void>;
+  /** Same action as the command-palette "Sync now": drain intents + refresh the heartbeat. */
+  syncNow(): Promise<void>;
+  /**
+   * The sidebar's account-key half (agenda.ts). The passphrase is used once
+   * to derive the root key into device-local storage; it is never stored.
+   */
+  agendaKeyState(): AgendaKeyState;
+  verifyPassphrase(passphrase: string): Promise<{ ok: boolean; message: string }>;
+  forgetPassphrase(): Promise<void>;
+  openAgenda(): Promise<void>;
+  /** The viewer picker (companion 4.2, decision 9): who the agenda shows tasks for. */
+  listUsers(): AgendaUser[];
+  getViewer(): string | null;
+  /** True while the viewer is the pairing's default rather than an explicit choice. */
+  viewerIsDefault(): boolean;
+  setViewer(userSyncId: string | null): Promise<void>;
+  /** Vault task scope (companion §6): which non-daily notes are task sources. */
+  getScope(): VaultScope | null;
+  setScope(scope: VaultScope): Promise<void>;
+  /** Project and goal note workspaces (companion §4.3, rulings D and E). */
+  getProjectNotes(): ProjectNoteSettings;
+  setProjectNotes(s: ProjectNoteSettings): Promise<void>;
+  /** The last template problem (companion §4.4): a missing note, a refused interactive template, a failed render. Null when none. */
+  templateStatus?(): string | null;
+  /** The vault's pairing this copy is behind (the pairing split, 2026-09-29), or null while current. */
+  stalePairing?(): StalePairing | null;
+  /** Editor hiding (display only, editorHiding.ts). */
+  getEditorHiding(): EditorHidingSettings;
+  setEditorHiding(s: EditorHidingSettings): Promise<void>;
+}
+
+const pairedSince = (pairing: BridgePairing): string => {
+  const t = Date.parse(pairing.pairedAt);
+  return Number.isFinite(t) ? new Date(t).toLocaleDateString() : 'unknown date';
+};
+
+export class BridgeSettingTab extends PluginSettingTab {
+  private host: BridgeSettingsHost;
+  private busy = false;
+  private syncing = false;
+
+  constructor(host: BridgeSettingsHost) {
+    super(host.app, host.plugin);
+    this.host = host;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    const pairing = this.host.getPairing();
+    if (pairing) {
+      this.displayPaired(pairing);
+      this.displayAccount();
+      this.displayScope();
+      this.displayProjectNotes();
+    } else {
+      this.displayUnpaired();
+    }
+    this.displayEditor();
+    this.displayBuildInfo();
+  }
+
+  private displayPaired(pairing: BridgePairing): void {
+    new Setting(this.containerEl)
+      .setName('Paired with GLANCEvault')
+      .setDesc(`Since ${pairedSince(pairing)} · ${pairing.vaultUrl}. dayGLANCE syncs with this vault through the plugin; to pair again with fresh keys, unpair and start pairing in dayGLANCE.`);
+
+    // THE PAIRING SPLIT (2026-09-29): this copy holds an older pairing than
+    // the vault. Loud, and above everything else: nothing this copy does
+    // reaches dayGLANCE until it is fixed.
+    const stale = this.host.stalePairing?.() ?? null;
+    if (stale) {
+      const theirs = stale.pairedAt ? Date.parse(stale.pairedAt) : NaN;
+      const when = Number.isFinite(theirs) ? new Date(theirs).toLocaleDateString() : 'a later date';
+      new Setting(this.containerEl)
+        .setName('This copy is behind the vault\'s pairing')
+        .setDesc(`The vault was paired again on ${when}, and this copy still holds the pairing from ${pairedSince(pairing)}. Until it catches up it applies no dayGLANCE changes and reports none of its own; another copy of the vault handles both. Restart Obsidian here if plugin settings sync is on (the pairing arrives with it), or start pairing again in dayGLANCE and enter the code here.`)
+        .setClass('mod-warning');
+    }
+
+    new Setting(this.containerEl)
+      .setName('Sync now')
+      .setDesc('Drain pending dayGLANCE changes into this vault and refresh the heartbeat. The same action as the command-palette entry; syncing also runs on its own every 30 seconds while Obsidian is open.')
+      .addButton((btn) => btn
+        .setButtonText('Sync now')
+        .setCta()
+        .onClick(async () => {
+          if (this.syncing) return;
+          this.syncing = true;
+          btn.setButtonText('Syncing…').setDisabled(true);
+          try {
+            await this.host.syncNow();
+            new Notice('dayGLANCE bridge: synced.');
+          } finally {
+            this.syncing = false;
+            btn.setButtonText('Sync now').setDisabled(false);
+          }
+        }));
+
+    // Two-step unpair: a single stray click on a settings page must not tear
+    // down the pairing. The first click arms the button; the second (within
+    // the timeout) unpairs; anything else disarms.
+    let armed = false;
+    let disarmTimer: number | null = null;
+    new Setting(this.containerEl)
+      .setName('Unpair dayGLANCE')
+      .setDesc('Forget this vault’s pairing credentials and stop the bridge. dayGLANCE reverts to direct vault access on its next sync. Also revoke the device token on your GLANCEvault server. Unpairing only forgets the local half.')
+      .addButton((btn) => btn
+        .setButtonText('Unpair')
+        .setWarning()
+        .onClick(async () => {
+          if (!armed) {
+            armed = true;
+            btn.setButtonText('Click again to unpair');
+            disarmTimer = window.setTimeout(() => {
+              armed = false;
+              btn.setButtonText('Unpair');
+            }, 5000);
+            return;
+          }
+          if (disarmTimer !== null) window.clearTimeout(disarmTimer);
+          await this.host.unpair();
+          this.display();
+        }));
+  }
+
+  // The sidebar view reads the account's task rows directly from
+  // GLANCEvault, which needs the account root key on this device. The
+  // passphrase field is transient: it derives the key (PBKDF2, the same
+  // derivation dayGLANCE runs) into the plugin's own IndexedDB store and is
+  // discarded. Nothing here is written to data.json, which Obsidian Sync
+  // would carry to every copy of the vault.
+  private displayAccount(): void {
+    new Setting(this.containerEl).setName('dayGLANCE account').setHeading();
+    const state = this.host.agendaKeyState();
+    if (state === 'ready') {
+      this.displayViewer();
+      new Setting(this.containerEl)
+        .setName('Sync passphrase verified on this device')
+        .setDesc('The dayGLANCE agenda view can read your tasks. The key is stored only on this device; the passphrase itself was not kept.')
+        .addButton((btn) => btn
+          .setButtonText('Open agenda')
+          .setCta()
+          .onClick(() => void this.host.openAgenda()))
+        .addButton((btn) => btn
+          .setButtonText('Forget')
+          .setWarning()
+          .onClick(async () => {
+            await this.host.forgetPassphrase();
+            this.display();
+          }));
+      return;
+    }
+    let passphrase = '';
+    let resultEl: HTMLElement | null = null;
+    const submit = async () => {
+      if (this.busy) return;
+      this.busy = true;
+      resultEl?.setText('Checking…');
+      try {
+        const result = await this.host.verifyPassphrase(passphrase);
+        if (result.ok) {
+          new Notice(`dayGLANCE bridge: ${result.message}`);
+          this.display();
+        } else {
+          resultEl?.setText(result.message);
+        }
+      } finally {
+        this.busy = false;
+      }
+    };
+    new Setting(this.containerEl)
+      .setName('Sync passphrase')
+      .setDesc('Your dayGLANCE database-sync passphrase. Needed once per device so the agenda view can decrypt your tasks. It is used to derive a key and then discarded.')
+      .addText((text) => {
+        text.setPlaceholder('passphrase').onChange((v) => { passphrase = v; });
+        text.inputEl.type = 'password';
+        text.inputEl.autocomplete = 'off';
+        text.inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') void submit(); });
+      })
+      .addButton((btn) => btn
+        .setButtonText('Verify')
+        .setCta()
+        .onClick(() => void submit()));
+    resultEl = this.containerEl.createEl('p', { text: '', cls: 'setting-item-description' });
+  }
+
+  // Who the agenda is for. Defaults to the user of the dayGLANCE device
+  // that paired this vault; the account's synced users fill the list.
+  private displayViewer(): void {
+    const users = this.host.listUsers();
+    const viewer = this.host.getViewer();
+    const known = users.some((u) => u.syncId === viewer);
+    new Setting(this.containerEl)
+      .setName('Show tasks for')
+      .setDesc(this.host.viewerIsDefault()
+        ? 'Set from the dayGLANCE device that paired this vault. Tasks, routines and calendars are filtered to this user; choose Everyone to see the whole account.'
+        : 'Tasks, routines and calendars are filtered to this user; choose Everyone to see the whole account.')
+      .addDropdown((dd) => {
+        dd.addOption('', 'Everyone');
+        for (const u of users) dd.addOption(u.syncId, u.name);
+        if (viewer && !known) dd.addOption(viewer, `Unknown user (${viewer.slice(0, 8)})`);
+        dd.setValue(viewer ?? '');
+        dd.onChange(async (v) => {
+          await this.host.setViewer(v || null);
+          this.display();
+        });
+      });
+  }
+
+  // Which notes beyond the daily notes are task sources. Folders and tags
+  // are two ways to organize a vault; both are offered, neither privileged.
+  private displayScope(): void {
+    new Setting(this.containerEl).setName('Vault task scope').setHeading();
+    const current = this.host.getScope() ?? { folders: [], tags: [], completionWindowDays: SCOPE_WINDOW_DEFAULT_DAYS };
+    let folders = current.folders.join('\n');
+    let tags = current.tags.join('\n');
+    let windowDays = String(current.completionWindowDays);
+    const save = async () => {
+      const next = normalizeScope({
+        folders: folders.split(/\r?\n/),
+        tags: tags.split(/\r?\n/),
+        completionWindowDays: Number(windowDays),
+      });
+      await this.host.setScope(next);
+    };
+    this.containerEl.createEl('p', {
+      cls: 'setting-item-description',
+      text: 'Daily notes are always task sources. Add folders and/or tags to include other notes: their open tasks (and tasks completed within the window) become dayGLANCE tasks, stamped with an identity like daily-note tasks. Notes are brought in a few at a time.',
+    });
+    new Setting(this.containerEl)
+      .setName('Folders')
+      .setDesc('One vault-relative folder per line, e.g. Projects. Every note under it is included.')
+      .addTextArea((ta) => {
+        ta.setPlaceholder('Projects\nAreas/Home').setValue(folders).onChange((v) => { folders = v; });
+        ta.inputEl.rows = 3;
+        ta.inputEl.addEventListener('blur', () => void save());
+      });
+    new Setting(this.containerEl)
+      .setName('Tags')
+      .setDesc('One tag per line, with or without #. A note carrying the tag (or a nested tag under it) is included.')
+      .addTextArea((ta) => {
+        ta.setPlaceholder('project\nclient/acme').setValue(tags).onChange((v) => { tags = v; });
+        ta.inputEl.rows = 3;
+        ta.inputEl.addEventListener('blur', () => void save());
+      });
+    new Setting(this.containerEl)
+      .setName('Completed-task window (days)')
+      .setDesc(`In included notes, completed tasks are tracked only when completed within this many days (${SCOPE_WINDOW_MIN_DAYS} to ${SCOPE_WINDOW_MAX_DAYS}). Open tasks are always tracked.`)
+      .addText((text) => {
+        text.setPlaceholder(String(SCOPE_WINDOW_DEFAULT_DAYS)).setValue(windowDays).onChange((v) => { windowDays = v; });
+        text.inputEl.type = 'number';
+        text.inputEl.min = String(SCOPE_WINDOW_MIN_DAYS);
+        text.inputEl.max = String(SCOPE_WINDOW_MAX_DAYS);
+        text.inputEl.addEventListener('blur', () => void save());
+      });
+  }
+
+  private displayProjectNotes(): void {
+    new Setting(this.containerEl).setName('Project and goal notes').setHeading();
+    const cur = this.host.getProjectNotes();
+    const draft: ProjectNoteSettings = { ...cur };
+    const save = async () => { await this.host.setProjectNotes(normalizeProjectNoteSettings(draft)); };
+    this.containerEl.createEl('p', {
+      cls: 'setting-item-description',
+      text: 'A dayGLANCE project or goal can create its own note here (from dayGLANCE, when the project is created). Linking an existing note never creates or moves anything; placement happens at creation only.',
+    });
+    const layoutLabels: Record<string, string> = {
+      note: 'One note per project or goal',
+      folder: 'A folder per project or goal, with an index note',
+      nested: 'Folders nested under the goal (Goals/<goal>/<project>/)',
+    };
+    new Setting(this.containerEl)
+      .setName('Layout')
+      .setDesc('Where a new note goes. Nested: a goal gets a folder under the goals folder, and a project with a goal gets its folder inside it.')
+      .addDropdown((d) => {
+        for (const l of PROJECT_NOTE_LAYOUTS) d.addOption(l, layoutLabels[l] ?? l);
+        d.setValue(cur.layout).onChange((v) => { draft.layout = v as ProjectNoteSettings['layout']; void save(); });
+      });
+    new Setting(this.containerEl)
+      .setName('Projects folder')
+      .setDesc('Vault-relative folder for new project notes (standalone projects under the nested layout too).')
+      .addText((t) => {
+        t.setPlaceholder('Projects').setValue(cur.projectsFolder).onChange((v) => { draft.projectsFolder = v; });
+        t.inputEl.addEventListener('blur', () => void save());
+      });
+    new Setting(this.containerEl)
+      .setName('Goals folder')
+      .setDesc('Vault-relative folder for new goal notes.')
+      .addText((t) => {
+        t.setPlaceholder('Goals').setValue(cur.goalsFolder).onChange((v) => { draft.goalsFolder = v; });
+        t.inputEl.addEventListener('blur', () => void save());
+      });
+    new Setting(this.containerEl)
+      .setName('Project template')
+      .setDesc('Optional: vault path of a template note. Rendered by Templater when it is installed and the template asks nothing interactively; otherwise {{title}}, {{date}} and {{goal}} are filled and the rest is left as is.')
+      .addText((t) => {
+        t.setPlaceholder('Templates/Project.md').setValue(cur.projectTemplate).onChange((v) => { draft.projectTemplate = v; });
+        t.inputEl.addEventListener('blur', () => void save());
+      });
+    new Setting(this.containerEl)
+      .setName('Goal template')
+      .setDesc('Optional: vault path of a template note for goals, rendered the same way.')
+      .addText((t) => {
+        t.setPlaceholder('Templates/Goal.md').setValue(cur.goalTemplate).onChange((v) => { draft.goalTemplate = v; });
+        t.inputEl.addEventListener('blur', () => void save());
+      });
+    new Setting(this.containerEl)
+      .setName('Daily note template')
+      .setDesc('Optional: vault path of a template note for daily notes dayGLANCE creates (a task added to today, a completion-log entry). Rendered the same way, here, when the note is created; {{date}} and {{title}} are the note\'s date. Without it, the daily note template text from dayGLANCE settings is used.')
+      .addText((t) => {
+        t.setPlaceholder('Templates/Daily.md').setValue(cur.dailyTemplate).onChange((v) => { draft.dailyTemplate = v; });
+        t.inputEl.addEventListener('blur', () => void save());
+      });
+    const issue = this.host.templateStatus?.() ?? null;
+    if (issue) {
+      this.containerEl.createEl('p', { cls: 'setting-item-description', text: `Template: ${issue}` });
+    }
+  }
+
+  private displayEditor(): void {
+    new Setting(this.containerEl).setName('Editor').setHeading();
+    const cur = this.host.getEditorHiding();
+    const save = (patch: Partial<EditorHidingSettings>) => void this.host.setEditorHiding({ ...this.host.getEditorHiding(), ...patch });
+    new Setting(this.containerEl)
+      .setName('Hide dayGLANCE block ids')
+      .setDesc('In Live Preview, hide the ^dg- identity token at the end of a task line, except on the line the cursor is on. Block ids you created yourself are not affected.')
+      .addToggle((t) => t.setValue(cur.hideBlockIds).onChange((v) => save({ hideBlockIds: v })));
+    new Setting(this.containerEl)
+      .setName('Hide completed tasks in project and goal notes')
+      .setDesc('In notes linked to a dayGLANCE project or goal, hide checked task lines in Live Preview and Reading view. The line stays in the note and shows again when the cursor is on it. Daily notes are not affected.')
+      .addToggle((t) => t.setValue(cur.hideCompletedInLinkedNotes).onChange((v) => save({ hideCompletedInLinkedNotes: v })));
+  }
+
+  private displayUnpaired(): void {
+    const status = new Setting(this.containerEl)
+      .setName('Not paired')
+      .setDesc('Checking for a pairing offer…');
+    // The offer check is async; Setting construction is not. Fill in.
+    void readPairingOfferText(this.host.app).then((text) => {
+      status.setDesc(text !== null
+        ? 'A pairing offer is waiting in this vault. Enter the code dayGLANCE is showing.'
+        : 'To pair: in dayGLANCE, open Settings → Obsidian Integration → Bridge plugin, click Start pairing, then enter the code here.');
+    });
+
+    let code = '';
+    let resultEl: HTMLElement | null = null;
+    new Setting(this.containerEl)
+      .setName('Pairing code')
+      .setDesc('The one-time code dayGLANCE displays (xxxx-xxxx-xxxxx).')
+      .addText((text) => {
+        text.setPlaceholder('xxxx-xxxx-xxxxx').onChange((v) => { code = v; });
+        text.inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') void this.pair(code, resultEl); });
+      })
+      .addButton((btn) => btn
+        .setButtonText('Pair')
+        .setCta()
+        .onClick(() => void this.pair(code, resultEl)));
+    resultEl = this.containerEl.createEl('p', { text: '' });
+  }
+
+  // Shown in BOTH views: "which main.js is this vault actually loading?" is
+  // a debugging question that comes up exactly when things are broken, so it
+  // must not depend on pairing state.
+  private displayBuildInfo(): void {
+    const version = (this.host.plugin as Plugin & { manifest?: { version?: string } }).manifest?.version ?? '?';
+    this.containerEl.createEl('p', {
+      text: `dayGLANCE Bridge v${version} · built ${buildTime()}`,
+      cls: 'setting-item-description',
+    });
+  }
+
+  private async pair(code: string, resultEl: HTMLElement | null): Promise<void> {
+    if (this.busy) return;
+    this.busy = true;
+    resultEl?.setText('Checking…');
+    try {
+      const result = await submitPairingCode(this.host, code);
+      if (result.ok) {
+        new Notice(`dayGLANCE bridge: ${result.message}`);
+        this.display(); // re-render into the paired view
+      } else {
+        resultEl?.setText(result.message);
+      }
+    } finally {
+      this.busy = false;
+    }
+  }
+}

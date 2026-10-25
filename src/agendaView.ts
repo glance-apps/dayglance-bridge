@@ -1,0 +1,319 @@
+// The dayGLANCE sidebar view (companion spec 4.2): a mini month calendar
+// over the agenda for the selected day, read from the AgendaStore's mirror.
+// Read-only with one exception — checking a task's box emits a completion
+// action for dayGLANCE to apply (agenda.ts). Rescheduling, drag-to-move and
+// creation are out of scope for v1 by ruling.
+//
+// Rendering is a plain re-render on every store change or navigation (the
+// agenda is a few dozen rows at most). Its styles are in the plugin's
+// styles.css and lean entirely on Obsidian's theme variables, so the view
+// follows the user's theme.
+
+import { ItemView, Keymap, Notice, WorkspaceLeaf } from 'obsidian';
+import {
+  datesWithItems, localDateStr, shiftDateStr, splitTitle, weekdayOrder, isCalendarEvent, eventHasEnded, agendaClock,
+  type AgendaItem, type RoutineItem,
+} from '@glance-apps/agenda-core';
+import type { AgendaStore } from './agenda';
+
+export const AGENDA_VIEW_TYPE = 'dayglance-agenda';
+// The projection window: ±35 days around today covers the visible month
+// grid from any neighbouring month plus the agenda's reachable days.
+export const AGENDA_WINDOW_DAYS = 35;
+
+const MONTH_FMT = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' });
+const DAY_FMT = new Intl.DateTimeFormat(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+const DOW_FMT = new Intl.DateTimeFormat(undefined, { weekday: 'narrow' });
+const TIME_FMT = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
+
+const noonOf = (dateStr: string): Date => new Date(`${dateStr}T12:00:00`);
+
+const formatTime = (hhmm: string): string => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm);
+  if (!m) return hhmm;
+  const d = new Date(2000, 0, 1, Number(m[1]), Number(m[2]));
+  return TIME_FMT.format(d);
+};
+
+const endOf = (hhmm: string, duration: number): string | null => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm);
+  if (!m || !(duration > 0)) return null;
+  const total = Number(m[1]) * 60 + Number(m[2]) + duration;
+  if (total >= 24 * 60) return null;
+  return formatTime(`${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`);
+};
+
+// dayGLANCE colors are Tailwind utility classes (colorUtils.js TASK_COLORS,
+// feed defaults like bg-gray-600); imported native events carry a real CSS
+// color. Map the classes to the palette's hex so the swatch renders; pass
+// real colors through; anything else gets no swatch.
+const TAILWIND: Record<string, string> = {
+  blue: '#3b82f6', purple: '#a855f7', green: '#22c55e', orange: '#f97316', pink: '#ec4899',
+  indigo: '#6366f1', red: '#ef4444', teal: '#14b8a6', yellow: '#eab308', gray: '#4b5563',
+  cyan: '#06b6d4', emerald: '#10b981', lime: '#84cc16', amber: '#f59e0b', rose: '#f43f5e',
+  violet: '#8b5cf6', fuchsia: '#d946ef', sky: '#0ea5e9', slate: '#64748b', stone: '#78716c',
+};
+const swatchColor = (color: string | null): string | null => {
+  if (!color) return null;
+  const m = /^bg-([a-z]+)-\d{3}$/.exec(color);
+  if (m) return TAILWIND[m[1]] ?? null;
+  if (color === 'task-calendar') return null;
+  return /^(#|rgb|hsl|[a-z]+$)/i.test(color) ? color : null;
+};
+
+const relativeAge = (ms: number): string => {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h} h ago`;
+  return `${Math.round(h / 24)} days ago`;
+};
+
+export class AgendaView extends ItemView {
+  private store: AgendaStore;
+  private weekStartDay: number;
+  private selected: string;
+  private month: { y: number; m: number }; // m is 0-based
+  private unsubscribe: (() => void) | null = null;
+  private root: HTMLElement | null = null;
+  // The view's own clock guard: `today` moves, and events END, without any
+  // store change. Once a minute, redraw only when either has happened.
+  private clock: number | null = null;
+  private renderedFor = '';
+  private renderedEnded = '';
+
+  constructor(leaf: WorkspaceLeaf, store: AgendaStore, weekStartDay = 0) {
+    super(leaf);
+    this.store = store;
+    this.weekStartDay = weekStartDay;
+    const today = localDateStr(new Date());
+    this.selected = today;
+    const d = noonOf(today);
+    this.month = { y: d.getFullYear(), m: d.getMonth() };
+  }
+
+  getViewType(): string { return AGENDA_VIEW_TYPE; }
+  getDisplayText(): string { return 'dayGLANCE'; }
+  getIcon(): string { return 'calendar-check'; }
+
+  async onOpen(): Promise<void> {
+    const content = this.containerEl.children[1] as HTMLElement;
+    content.empty();
+    this.root = content.createDiv({ cls: 'dg-agenda' });
+    this.unsubscribe = this.store.onChange(() => this.render());
+    this.clock = window.setInterval(() => {
+      const today = localDateStr(new Date());
+      if (today !== this.renderedFor || this.endedKey() !== this.renderedEnded) this.render();
+    }, 60_000);
+    this.render();
+    void this.store.refresh();
+  }
+
+  async onClose(): Promise<void> {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    if (this.clock !== null) window.clearInterval(this.clock);
+    this.clock = null;
+  }
+
+  /** Jump the grid and the agenda to a date (the ribbon/command land on today). */
+  showDate(dateStr: string): void {
+    this.selected = dateStr;
+    const d = noonOf(dateStr);
+    this.month = { y: d.getFullYear(), m: d.getMonth() };
+    this.render();
+  }
+
+  private render(): void {
+    const root = this.root;
+    if (!root) return;
+    root.empty();
+    const today = localDateStr(new Date());
+    this.renderedFor = today;
+    this.renderedEnded = this.endedKey();
+    const status = this.store.getStatus();
+
+    if (status.key !== 'ready') {
+      root.createDiv({ cls: 'dg-agenda-setup', text: status.key === 'unpaired'
+        ? 'Pair this vault with dayGLANCE to see your agenda here (Settings, dayGLANCE Bridge).'
+        : 'Enter your dayGLANCE sync passphrase in Settings, dayGLANCE Bridge, dayGLANCE account, to load your agenda on this device.' });
+      return;
+    }
+
+    const from = shiftDateStr(today, -AGENDA_WINDOW_DAYS);
+    const to = shiftDateStr(today, AGENDA_WINDOW_DAYS);
+    const agenda = this.store.agenda(from, to);
+    const dotted = datesWithItems(agenda);
+
+    this.renderMonth(root, today, dotted, from, to);
+    this.renderDay(root, today, agenda[this.selected] ?? [], from, to);
+    this.renderStatus(root, status);
+  }
+
+  private renderMonth(root: HTMLElement, today: string, dotted: Set<string>, from: string, to: string): void {
+    const head = root.createDiv({ cls: 'dg-agenda-month' });
+    head.createSpan({ cls: 'dg-agenda-month-title', text: MONTH_FMT.format(new Date(this.month.y, this.month.m, 1, 12)) });
+    const nav = head.createDiv({ cls: 'dg-agenda-month-nav' });
+    const prev = nav.createEl('button', { text: '‹', attr: { 'aria-label': 'Previous month' } });
+    const todayBtn = nav.createEl('button', { text: 'Today', attr: { 'aria-label': 'Go to today' } });
+    const next = nav.createEl('button', { text: '›', attr: { 'aria-label': 'Next month' } });
+    prev.addEventListener('click', () => this.shiftMonth(-1));
+    next.addEventListener('click', () => this.shiftMonth(1));
+    todayBtn.addEventListener('click', () => this.showDate(today));
+
+    const grid = root.createDiv({ cls: 'dg-agenda-grid' });
+    const order = weekdayOrder(this.weekStartDay);
+    for (const dow of order) {
+      // 2023-01-01 was a Sunday; +dow lands on the right weekday for a label.
+      grid.createDiv({ cls: 'dg-agenda-dow', text: DOW_FMT.format(new Date(2023, 0, 1 + dow, 12)) });
+    }
+    const first = new Date(this.month.y, this.month.m, 1, 12);
+    const lead = (first.getDay() - this.weekStartDay + 7) % 7;
+    const daysInMonth = new Date(this.month.y, this.month.m + 1, 0, 12).getDate();
+    const cells = Math.ceil((lead + daysInMonth) / 7) * 7;
+    const start = new Date(first);
+    start.setDate(first.getDate() - lead);
+    for (let i = 0; i < cells; i++) {
+      const d = new Date(start);
+      d.setDate(start.getDate() + i);
+      const ds = localDateStr(d);
+      const cell = grid.createDiv({ cls: 'dg-agenda-day', text: String(d.getDate()) });
+      if (d.getMonth() !== this.month.m) cell.addClass('is-outside');
+      if (ds === today) cell.addClass('is-today');
+      if (ds === this.selected) cell.addClass('is-selected');
+      if (dotted.has(ds)) cell.addClass('has-items');
+      if (ds < from || ds > to) cell.setAttr('title', 'Outside the loaded window');
+      cell.addEventListener('click', () => { this.selected = ds; this.render(); });
+    }
+  }
+
+  private shiftMonth(delta: number): void {
+    const d = new Date(this.month.y, this.month.m + delta, 1, 12);
+    this.month = { y: d.getFullYear(), m: d.getMonth() };
+    this.render();
+  }
+
+  private renderDay(root: HTMLElement, today: string, items: AgendaItem[], from: string, to: string): void {
+    const head = root.createDiv({ cls: 'dg-agenda-heading' });
+    const label = this.selected === today ? 'Today' : DAY_FMT.format(noonOf(this.selected));
+    head.createSpan({ cls: 'dg-agenda-heading-date', text: label });
+    // Events are not completable, so they never count as open: the count
+    // is over tasks, with events tallied separately.
+    const tasks = items.filter((i) => !isCalendarEvent(i));
+    const events = items.length - tasks.length;
+    const parts: string[] = [];
+    if (tasks.length) parts.push(`${tasks.filter((i) => !i.completed).length} open of ${tasks.length}`);
+    if (events) parts.push(`${events} event${events === 1 ? '' : 's'}`);
+    head.createSpan({ cls: 'dg-agenda-heading-count', text: parts.join(', ') });
+
+    if (this.selected < from || this.selected > to) {
+      root.createDiv({ cls: 'dg-agenda-empty', text: `Only ${AGENDA_WINDOW_DAYS} days either side of today are loaded here. Open dayGLANCE for the rest.` });
+      return;
+    }
+    if (!items.length) {
+      root.createDiv({ cls: 'dg-agenda-empty', text: 'Nothing scheduled.' });
+    }
+    if (items.length) this.renderItems(root, items);
+    this.renderRoutines(root, this.store.routinesFor(this.selected));
+  }
+
+  private renderItems(root: HTMLElement, items: AgendaItem[]): void {
+    const list = root.createEl('ul', { cls: 'dg-agenda-list' });
+    const clock = agendaClock();
+    for (const item of items) {
+      const event = isCalendarEvent(item);
+      // An event is "done" once it has ended (owner ruling): same
+      // strikethrough and checked box as a completed task.
+      const done = item.completed || (event && eventHasEnded(item, clock));
+      const pending = !done && this.store.isPending(item.id);
+      const li = list.createEl('li', { cls: 'dg-agenda-item' });
+      if (done) li.addClass('is-done');
+      if (pending) li.addClass('is-pending');
+      const box = li.createEl('input', { type: 'checkbox' });
+      box.checked = done || pending;
+      // Completion only, and only from here for dayGLANCE-owned items:
+      // calendar events are never completed by hand (they end on their
+      // own); a done box stays done.
+      box.disabled = done || pending || event;
+      if (event) box.setAttr('title', done ? 'This event has ended' : 'Calendar event: it will be marked done once it ends');
+      box.addEventListener('change', () => {
+        if (!box.checked) return;
+        box.disabled = true;
+        void this.store.complete(item).then((r) => {
+          if (!r.ok) { new Notice(`dayGLANCE: ${r.message}`); this.render(); }
+        });
+      });
+      const swatch = swatchColor(item.color);
+      if (swatch) li.createDiv({ cls: 'dg-agenda-swatch' }).setCssProps({ '--dg-agenda-swatch': swatch });
+      const body = li.createDiv({ cls: 'dg-agenda-body' });
+      if (!item.isAllDay && item.startTime) {
+        const end = item.duration ? endOf(item.startTime, item.duration) : null;
+        body.createSpan({ cls: 'dg-agenda-time', text: end ? `${formatTime(item.startTime)} to ${end}` : formatTime(item.startTime) });
+      }
+      const title = body.createSpan({ cls: 'dg-agenda-title' });
+      this.renderTitle(title, item.title);
+      if (item.recurring) title.createSpan({ cls: 'dg-agenda-badge', text: '↻', attr: { title: 'Recurring' } });
+      if (item.imported) title.createSpan({ cls: 'dg-agenda-badge', text: '📅', attr: { title: item.calendarName ? `Calendar: ${item.calendarName}` : 'Imported calendar event' } });
+    }
+  }
+
+  // Tags faded and italic; wikilinks shown as their display text and
+  // clickable (mod-click opens in a new leaf, like Obsidian's own links).
+  private renderTitle(el: HTMLElement, title: string): void {
+    for (const seg of splitTitle(title)) {
+      if (seg.type === 'text') { el.appendText(seg.text); continue; }
+      if (seg.type === 'tag') { el.createSpan({ cls: 'dg-agenda-tag', text: seg.text }); continue; }
+      const a = el.createEl('a', { cls: 'dg-agenda-link', text: seg.text, attr: { 'aria-label': `Open ${seg.target}` } });
+      a.addEventListener('click', (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        void this.app.workspace.openLinkText(seg.target, '', Keymap.isModEvent(evt));
+      });
+    }
+  }
+
+  // The day's placed routines, visually a different species from tasks: a
+  // strip of pills (no checkbox, no swatch), name and start time only.
+  // Routines are day-scoped in dayGLANCE (placed each morning, cleared at
+  // midnight), so only the stamped day ever has any.
+  private renderRoutines(root: HTMLElement, routines: RoutineItem[]): void {
+    if (!routines.length) return;
+    root.createDiv({ cls: 'dg-agenda-routines-heading', text: 'Routines' });
+    const list = root.createEl('ul', { cls: 'dg-agenda-routines' });
+    for (const r of routines) {
+      const li = list.createEl('li', { cls: 'dg-agenda-routine' });
+      if (r.completed) li.addClass('is-done');
+      li.createSpan({ cls: 'dg-agenda-routine-dot' });
+      if (r.startTime) li.createSpan({ cls: 'dg-agenda-routine-time', text: formatTime(r.startTime) });
+      li.createSpan({ cls: 'dg-agenda-routine-name', text: r.name });
+      li.setAttr('title', r.startTime ? `${r.name} at ${formatTime(r.startTime)}` : `${r.name} (any time)`);
+    }
+  }
+
+  // Which of the selected day's events have ended, as a comparable key: the
+  // minute clock redraws when this changes, so an event flips to done on
+  // time without waiting for a store change.
+  private endedKey(): string {
+    const items = this.store.agenda(this.selected, this.selected)[this.selected] ?? [];
+    const clock = agendaClock();
+    return items.filter((i) => isCalendarEvent(i) && eventHasEnded(i, clock)).map((i) => i.id).join('|');
+  }
+
+  private renderStatus(root: HTMLElement, status: ReturnType<AgendaStore['getStatus']>): void {
+    const parts: string[] = [];
+    if (status.refreshing) parts.push('Refreshing…');
+    else if (status.lastRefreshedAt) parts.push(`Updated ${relativeAge(status.lastRefreshedAt)}`);
+    else parts.push('Loading…');
+    if (status.undecryptable) parts.push(`${status.undecryptable} rows unreadable with this passphrase`);
+    // Calendar events come from dayGLANCE's projection, not the mirror, and
+    // each day's events are as old as the last time a device fetched that
+    // day: say so for the selected day once it is stale enough to matter.
+    const dayAt = status.calendarDayAsOf[this.selected] ?? status.calendarAsOf;
+    if (dayAt && Date.now() - dayAt > 60 * 60_000) parts.push(`Calendar for this day as of ${relativeAge(dayAt)}`);
+    if (status.lastError) parts.push(status.lastError);
+    const el = root.createDiv({ cls: 'dg-agenda-status', text: parts.join(' · ') });
+    if (status.lastError || status.undecryptable) el.addClass('is-error');
+  }
+}

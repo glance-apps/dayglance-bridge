@@ -1,0 +1,591 @@
+// dayGLANCE Bridge — Obsidian build-out Phases 5–6
+// (docs/obsidian-buildout-spec.md in the dayGLANCE repo, §3.2–§3.4, §6).
+//
+// Still deliberately small: a liveness heartbeat, the pairing flow (a
+// settings tab plus command-palette entries — settingsTab.ts / pairing.ts),
+// and the intent transport (bridge.ts). The plugin is built to be EXTRACTED
+// to its own public repo before directory submission — it imports nothing
+// from dayGLANCE and knows nothing about it beyond the shared vault-format
+// contracts.
+//
+// THE HEARTBEAT. `.dayglance/heartbeat` is written every 30 seconds while
+// Obsidian has this vault open. dayGLANCE reads it for two things:
+//   • suppressing launch-on-write — a fresh heartbeat means Obsidian is
+//     already running, so waking it via obsidian:// would be redundant;
+//   • arbitration state (spec §3.2/§3.3) — `paired` and `accountId` now
+//     reflect the stored pairing; a fresh AND paired heartbeat is what will
+//     make dayGLANCE stop writing to the vault directly.
+//
+// Payload: {"paired": bool, "accountId": string|null, "deviceId": string,
+// "ts": ISO-8601}. The `deviceId` WIRE KEY predates the per-vault pairing
+// ruling and is kept (the shape is final); its semantics are "per
+// vault-copy install id" — minted once per install into data.json, which
+// rides Obsidian's settings sync to every copy of this vault, so copies
+// share it exactly as they share the pairing. It identifies which vault
+// copy is beating, not a paired device. Dot-paths never ride Obsidian
+// Sync, are invisible to the indexer, and appear in neither search nor the
+// graph — the adapter API is used throughout because the vault API
+// deliberately cannot see them. (A vault synced by a third-party file
+// syncer — iCloud Drive, Syncthing — WILL carry the file across devices;
+// the dayGLANCE side documents why that false-positive is benign for what
+// the heartbeat gates.)
+//
+// PAIRING (spec §3.2/§3.4) lives in pairing.ts: dayGLANCE drops a sealed
+// offer at `.dayglance/pairing`, the user types the displayed code here,
+// the credentials are verified against GLANCEvault and stored in data.json.
+
+import { Notice, Platform, Plugin, normalizePath } from 'obsidian';
+// The shared vault-format core — the SAME package dayGLANCE consumes, so the
+// heartbeat's writer and its readers can never drift apart (the first proof
+// the format-package boundary works in both directions). Bundled into
+// main.js by esbuild; `file:`-linked while the plugin lives in the dayGLANCE
+// repo, a published dependency after extraction.
+import { heartbeatPayload } from '@glance-apps/obsidian-format';
+import { TFile } from 'obsidian';
+import { PairingModal, readPairingOfferText, type BridgePairing } from './pairing';
+import { BridgeSettingTab, type BridgeSettingsHost } from './settingsTab';
+import { BridgeTransport, publishPairingMeta, type BridgeState, type BridgeConfigRow } from './bridge';
+import { localStateStoreFor, migrateToLocalState, splitBridgeState, joinBridgeState, type LocalBridgeData, type LocalStateStore } from './localState';
+import { AgendaStore } from './agenda';
+import { normalizeScope, scopeIsActive, normalizeProjectNoteSettings, type VaultScope, type ProjectNoteSettings } from '@glance-apps/obsidian-format';
+import { localDateStr } from '@glance-apps/agenda-core';
+import { AgendaView, AGENDA_VIEW_TYPE } from './agendaView';
+import { LinkTargetModal } from './linkModal';
+import { NoteBlockWriter } from './noteBlocks';
+import { applyEditorHidingSettings, clearEditorHidingSettings, editorHidingExtension, markCompletedInReadingView, refreshEditorHiding, type EditorHidingHost } from './editorHiding';
+import { normalizeEditorHidingSettings, type EditorHidingSettings } from './editorHidingRules';
+
+const HEARTBEAT_DIR = '.dayglance';
+const HEARTBEAT_PATH = `${HEARTBEAT_DIR}/heartbeat`;
+
+// 30 seconds per spec §6 Phase 5. On mobile the interval simply stops
+// ticking while the app is backgrounded (WebView timers are frozen) — which
+// is the CORRECT signal: a backgrounded Obsidian isn't meaningfully
+// running, its Sync isn't syncing, and dayGLANCE should treat it as absent.
+// The staleness threshold on the reading side (minutes) absorbs ordinary
+// foreground jitter.
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+interface BridgeData {
+  // LEGACY on an Obsidian with device-local storage (localState.ts): the
+  // device id and the bridge bookkeeping live per copy now, and these two
+  // fields are migrated out of data.json on load. They remain the live
+  // shape only on an Obsidian without the local-storage API.
+  deviceId?: string;
+  pairing?: BridgePairing;
+  bridge?: BridgeState;
+  // The shared config-row cache (the one BridgeState field that is
+  // legitimately fleet-wide: dayGLANCE publishes one config per account).
+  bridgeConfig?: BridgeConfigRow | null;
+  // The agenda's viewer, when chosen explicitly in settings (companion 4.2,
+  // decision 9). Absent = the pairing's default. Rides data.json like the
+  // pairing itself: the owner's assumption of record is one person per
+  // vault, so vault scope is the right scope.
+  viewer?: { userSyncId: string | null };
+  // Vault task scope (companion §6, ruling D): folders and/or tags whose
+  // notes are task sources, and the completion window (ruling E). Absent =
+  // daily notes only.
+  scope?: VaultScope;
+  // Project and goal note workspaces (companion §4.3, rulings D and E):
+  // where a note born in dayGLANCE goes and which template it uses.
+  projectNotes?: ProjectNoteSettings;
+  // Editor hiding (display only, editorHiding.ts): dayGLANCE's own block
+  // ids off the cursor line, and checked lines in linked notes.
+  editorHiding?: Partial<EditorHidingSettings>;
+}
+
+const mintDeviceId = (): string => {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch {
+    /* fall through */
+  }
+  // Old webview without randomUUID — collision odds are irrelevant for a
+  // per-install liveness id.
+  return `dgb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+};
+
+// The copy status row's name for this copy: the machine's hostname where
+// Obsidian runs on Electron (the owner's own server sees it; it is what
+// makes "Windows-desktop is behind" readable), else the platform.
+const platformLabel = (): string => {
+  if (Platform.isIosApp) return 'ios';
+  if (Platform.isAndroidApp) return 'android';
+  if (Platform.isMacOS) return 'mac';
+  if (Platform.isWin) return 'windows';
+  if (Platform.isLinux) return 'linux';
+  return 'unknown';
+};
+const copyName = (): string | null => {
+  try {
+    const req = (window as unknown as { require?: (m: string) => { hostname?: () => string } }).require;
+    const host = Platform.isDesktopApp && typeof req === 'function' ? req('os')?.hostname?.() : null;
+    if (typeof host === 'string' && host.trim()) return host.trim();
+  } catch { /* no Node here */ }
+  const label = platformLabel();
+  return label === 'unknown' ? null : { ios: 'iPhone or iPad', android: 'Android', mac: 'Mac', windows: 'Windows', linux: 'Linux' }[label] ?? null;
+};
+
+export default class DayGlanceBridgePlugin extends Plugin {
+  private deviceId = '';
+  private data: BridgeData = {};
+  // Per-copy state (localState.ts). Empty when the store is unavailable.
+  private local: LocalBridgeData = {};
+  private localStore!: LocalStateStore;
+  private transport!: BridgeTransport;
+  private noteBlocks!: NoteBlockWriter;
+  // The sidebar view's data (companion spec 4.2): a read mirror of the
+  // account's task rows plus the completion-action emitter.
+  private agenda!: AgendaStore;
+  // One nudge per offer appearance: reset when the file disappears, so a
+  // fresh offer (re-pair) nudges again but a sitting one doesn't nag.
+  private offerNoticed = false;
+
+  async onload(): Promise<void> {
+    this.data = ((await this.loadData()) as BridgeData | null) ?? {};
+    this.localStore = localStateStoreFor(this.app);
+    if (this.localStore.available) {
+      // Device-local bookkeeping (localState.ts): seed from data.json once,
+      // strip the per-copy fields from the shared file, and mint a per-copy
+      // device id when none is known here.
+      const migrated = migrateToLocalState(this.data, this.localStore.load());
+      this.local = migrated.local;
+      if (migrated.dataChanged) await this.saveData(this.data);
+      if (!this.local.deviceId) this.local.deviceId = mintDeviceId();
+      this.localStore.save(this.local);
+      this.deviceId = this.local.deviceId;
+    } else {
+      if (!this.data.deviceId) {
+        this.data.deviceId = mintDeviceId();
+        await this.saveData(this.data);
+      }
+      this.deviceId = this.data.deviceId;
+    }
+
+    this.agenda = new AgendaStore({
+      app: this.app,
+      getPairing: () => this.data.pairing,
+      getViewer: () => this.viewer(),
+    });
+    void this.agenda.init();
+
+    this.transport = new BridgeTransport({
+      app: this.app,
+      getPairing: () => this.data.pairing,
+      getBridgeState: () => this.bridgeState(),
+      saveBridgeState: (state) => this.saveBridgeState(state),
+      // A successful drain (tick or SSE nudge) is the agenda's refresh
+      // signal too: dayGLANCE's pushes advance the same account seq. The
+      // note blocks re-render from the refreshed mirror (companion §4.3).
+      onSynced: () => { void this.agenda.refresh().then(() => this.noteBlocks.tick()); },
+      getScope: () => this.scope(),
+      getProjectNotes: () => normalizeProjectNoteSettings(this.data.projectNotes),
+      getViewer: () => this.viewer(),
+      getDeviceId: () => this.deviceId,
+      // The copy status row (the fleet-wide half of the pairing split):
+      // how this copy is named to every dayGLANCE device.
+      getCopyName: () => copyName(),
+      getPlatform: () => platformLabel(),
+      getPluginVersion: () => this.manifest.version,
+      // A note linked or unlinked while open: its completed-line hiding
+      // follows the map without waiting for the next edit.
+      onLinkedNotesChanged: () => refreshEditorHiding(this.app),
+    });
+    this.noteBlocks = new NoteBlockWriter({
+      app: this.app,
+      paired: () => !!this.data.pairing,
+      linkedNotes: () => this.transport.linkedNotes(),
+      blockInputs: () => this.agenda.blockInputs(),
+      bufferDirty: (path) => this.transport.bufferDirty(path),
+    });
+
+    // Editor hiding (display only): the decorations always run; the two
+    // settings only toggle body classes the stylesheet keys on.
+    const hidingHost: EditorHidingHost = {
+      app: this.app,
+      isLinkedNote: (path) => this.transport.linkedNotes().has(path),
+      getSettings: () => this.editorHiding(),
+    };
+    this.registerEditorExtension(editorHidingExtension(hidingHost));
+    this.registerMarkdownPostProcessor((el, ctx) => markCompletedInReadingView(hidingHost, el, ctx.sourcePath));
+    applyEditorHidingSettings(document, this.editorHiding());
+
+    this.registerView(AGENDA_VIEW_TYPE, (leaf) => new AgendaView(leaf, this.agenda));
+    this.addRibbonIcon('calendar-check', 'Open dayGLANCE agenda', () => { void this.openAgenda(); });
+    this.addCommand({
+      id: 'open-agenda',
+      name: 'Open agenda',
+      callback: () => { void this.openAgenda(); },
+    });
+
+    // Outbound observations: report file state, never inferred edits
+    // (spec §3.6 as amended). Debounced per path inside the transport;
+    // inert while unpaired. layoutReady gates out the initial index churn.
+    this.app.workspace.onLayoutReady(() => {
+      this.registerEvent(this.app.vault.on('modify', (f) => { if (f instanceof TFile) this.transport.scheduleObservation(f); }));
+      this.registerEvent(this.app.vault.on('create', (f) => { if (f instanceof TFile) this.transport.noteCreated(f); }));
+      this.registerEvent(this.app.vault.on('delete', (f) => { if (f instanceof TFile) this.transport.reportDeleted(f.path); }));
+      this.registerEvent(this.app.vault.on('rename', (f, oldPath) => {
+        // Link following, scope re-classification (a move out is a
+        // withdrawal, a move in an entry), arrival time, then the reports.
+        if (f instanceof TFile) this.transport.noteRenamed(oldPath, f);
+      }));
+      // Frontmatter edits (the id key) surface as metadata changes, not file modifies.
+      this.registerEvent(this.app.metadataCache.on('changed', (f) => { if (f instanceof TFile) this.transport.noteMetaChanged(f.path); }));
+    });
+
+    // Project and goal notes (companion §4.3): link or unlink the active note.
+    this.addCommand({
+      id: 'link-note-to-project',
+      name: 'Link current note to a dayGLANCE project or goal',
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== 'md') return false;
+        if (checking) return true;
+        if (!this.data.pairing) { new Notice('dayGLANCE bridge: not paired.'); return true; }
+        const targets = this.agenda.linkTargets();
+        if (!targets.length) {
+          new Notice('dayGLANCE bridge: no projects or goals in the mirror yet. Open the agenda once, then retry.');
+          return true;
+        }
+        new LinkTargetModal(this.app, targets, (t) => {
+          void this.transport.linkNote(file, t.id).then((r) => new Notice(`dayGLANCE bridge: ${r.message}`));
+        }).open();
+        return true;
+      },
+    });
+    this.addCommand({
+      id: 'unlink-note-from-project',
+      name: 'Unlink current note from dayGLANCE',
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== 'md') return false;
+        if (!checking) void this.transport.unlinkNote(file).then((r) => new Notice(`dayGLANCE bridge: ${r.message}`));
+        return true;
+      },
+    });
+
+    // Full ids in the palette: dayglance-bridge:<id> (Obsidian prefixes the
+    // manifest id). Sync now = drain pending intents + refresh the beat.
+    this.addCommand({
+      id: 'sync-now',
+      name: 'Sync now',
+      callback: () => {
+        void Promise.all([this.transport.drain(), this.writeHeartbeat()]).then(() => {
+          new Notice(this.data.pairing
+            ? 'dayGLANCE bridge: synced.'
+            : 'dayGLANCE bridge: heartbeat refreshed (not paired, nothing to sync).');
+        });
+      },
+    });
+
+    // ONE pairing host, shared by the settings tab (the Obsidian-idiomatic
+    // front door) and the command-palette modal — same flow, two entries.
+    const host: BridgeSettingsHost = {
+      app: this.app,
+      plugin: this,
+      getPairing: () => this.data.pairing,
+      storePairing: async (pairing) => {
+        this.data.pairing = pairing;
+        // A re-pair rotates the subkey: old rows are unreadable, and the
+        // cursor state belongs to the superseded stream. Start clean.
+        this.resetBridgeState();
+        await this.saveData(this.data);
+        // Publish the plaintext pairing-meta row — how OTHER dayGLANCE
+        // devices discover the salt and start emitting (bridge.ts). Its
+        // ack is ours: recorded so the echo never wakes an idle drain.
+        this.transport.recordOwnSeq(await publishPairingMeta(pairing, undefined, this.viewer(), this.scope()).catch((e) => { console.error('dayGLANCE bridge: meta publish failed', e); return null; }));
+        // Beat immediately so dayGLANCE's pairing panel confirms
+        // without waiting out the interval.
+        await this.writeHeartbeat();
+      },
+      unpair: () => this.unpair(),
+      // Same action as the "Sync now" command below — one behavior, two doors.
+      syncNow: async () => {
+        await Promise.all([this.transport.drain(), this.writeHeartbeat()]);
+      },
+      agendaKeyState: () => this.agenda.getStatus().key,
+      verifyPassphrase: (passphrase) => this.agenda.verifyPassphrase(passphrase),
+      forgetPassphrase: () => this.agenda.forgetKey(),
+      openAgenda: () => this.openAgenda(),
+      listUsers: () => this.agenda.users(),
+      getViewer: () => this.viewer(),
+      viewerIsDefault: () => this.data.viewer === undefined,
+      setViewer: async (userSyncId) => {
+        this.data.viewer = { userSyncId };
+        await this.saveData(this.data);
+        this.agenda.notifyViewerChanged();
+        // The viewer scopes what dayGLANCE writes into this vault too:
+        // republish the meta row so its devices pick the change up on their
+        // next cycle (the row is plaintext; a user id is not a secret).
+        if (this.data.pairing) {
+          this.transport.recordOwnSeq(await publishPairingMeta(this.data.pairing, undefined, userSyncId, this.scope()).catch((e) => { console.error('dayGLANCE bridge: meta publish failed', e); return null; }));
+        }
+      },
+      getProjectNotes: () => normalizeProjectNoteSettings(this.data.projectNotes),
+      setProjectNotes: async (s) => {
+        this.data.projectNotes = normalizeProjectNoteSettings(s);
+        await this.saveData(this.data);
+      },
+      templateStatus: () => this.transport.templateStatus(),
+      stalePairing: () => this.transport.stalePairingInfo(),
+      getEditorHiding: () => this.editorHiding(),
+      setEditorHiding: async (s) => {
+        this.data.editorHiding = normalizeEditorHidingSettings(s);
+        await this.saveData(this.data);
+        applyEditorHidingSettings(document, this.editorHiding());
+      },
+      getScope: () => this.scope(),
+      setScope: async (scope) => {
+        this.data.scope = normalizeScope(scope);
+        await this.saveData(this.data);
+        if (this.data.pairing) {
+          this.transport.recordOwnSeq(await publishPairingMeta(this.data.pairing, undefined, this.viewer(), this.scope()).catch((e) => { console.error('dayGLANCE bridge: meta publish failed', e); return null; }));
+        }
+        this.transport.scopeChanged();
+        this.transport.adoptTick();
+      },
+    };
+    this.addSettingTab(new BridgeSettingTab(host));
+
+    this.addCommand({
+      id: 'enter-pairing-code',
+      name: 'Enter pairing code',
+      callback: () => {
+        new PairingModal(host).open();
+      },
+    });
+
+    this.addCommand({
+      id: 'unpair',
+      name: 'Unpair from GLANCEvault',
+      callback: () => {
+        if (!this.data.pairing) {
+          new Notice('dayGLANCE bridge: not paired.');
+          return;
+        }
+        void this.unpair();
+      },
+    });
+
+    // First beat immediately — registerInterval's first tick is a full
+    // interval away, and dayGLANCE's staleness window shouldn't have to
+    // absorb Obsidian's startup. The offer check and the intent drain ride
+    // the same cadence: drain-on-open plus interval-while-foreground is the
+    // mobile story too (frozen background timers simply pause both, exactly
+    // like the heartbeat).
+    void this.writeHeartbeat();
+    void this.checkForPairingOffer();
+    void this.transport.drain();
+    // Scope adoption walks the metadata cache, which is complete only after
+    // layout is ready; the tick then reports a few notes per interval.
+    this.app.workspace.onLayoutReady(() => { this.transport.adoptTick(); this.transport.linkTick(); });
+    this.registerInterval(
+      window.setInterval(() => {
+        void this.writeHeartbeat();
+        void this.checkForPairingOffer();
+        void this.transport.drain();
+        this.transport.adoptTick();
+        this.transport.linkTick();
+        void this.noteBlocks.tick();
+      }, HEARTBEAT_INTERVAL_MS),
+    );
+  }
+
+  /**
+   * data.json changed underneath a running copy: Obsidian Sync delivered
+   * another copy's settings (Obsidian ≥ 1.5.7 calls this; older builds
+   * pick the file up at the next load, as before). THE PAIRING SPLIT
+   * (2026-09-29): the plugin read its pairing only at load, so two copies
+   * ran for two days on a key the vault had rotated away from, and deleted
+   * every intent they could not read. Now a re-pair reaches every running
+   * copy: the shared fields are reloaded, and a changed pairing generation
+   * resets the stream state exactly as entering the code here would.
+   */
+  async onExternalSettingsChange(): Promise<void> {
+    let fresh: BridgeData | null = null;
+    try { fresh = ((await this.loadData()) as BridgeData | null) ?? {}; } catch (e) { console.error('dayGLANCE bridge: could not reload the synced settings', e); return; }
+    const before = this.data.pairing?.generation ?? null;
+    // Device-local fields never live in data.json once the local store is
+    // available; keep the in-memory copies where they still do.
+    const keep = this.localStore.available ? {} : { deviceId: this.data.deviceId, bridge: this.data.bridge };
+    this.data = { ...fresh, ...keep };
+    const after = this.data.pairing?.generation ?? null;
+    if (after !== before) {
+      // A new pairing (or an unpairing) arrived through sync: the cursor and
+      // the applied set belong to the superseded stream.
+      if (after !== null) this.resetBridgeState(); else this.clearBridgeState();
+      console.debug(after !== null
+        ? `dayGLANCE bridge: synced settings carry a new pairing (paired ${this.data.pairing?.pairedAt ?? 'unknown date'}); switching to it.`
+        : 'dayGLANCE bridge: synced settings carry no pairing; this copy is now unpaired.');
+      this.agenda.notifyViewerChanged();
+      await this.writeHeartbeat();
+      void this.transport.drain();
+    }
+    applyEditorHidingSettings(document, this.editorHiding());
+    this.transport.scopeChanged();
+  }
+
+  onunload(): void {
+    // Live sync (Phase 7): close the SSE stream and cancel its timers —
+    // a disabled plugin must not hold a socket open.
+    this.transport.shutdown();
+    this.noteBlocks.dispose();
+    this.agenda.dispose();
+    clearEditorHidingSettings(document);
+    // Best-effort: a graceful quit (or a plugin disable — equally "no
+    // bridge here") removes the file so readers see the truth immediately
+    // instead of waiting out the staleness window. Crashes skip this, which
+    // is exactly what the staleness window exists for.
+    void this.app.vault.adapter.remove(normalizePath(HEARTBEAT_PATH)).catch(() => {
+      /* never surface — the file may simply not exist yet */
+    });
+  }
+
+  // Forget the local credentials and start beating unpaired. Best-effort:
+  // clearing the meta row tells dayGLANCE devices to stop emitting; if the
+  // token is already revoked server-side that call just fails.
+  private async unpair(): Promise<void> {
+    const previous = this.data.pairing;
+    if (!previous) return;
+    // This copy's status row goes with its credentials (best-effort).
+    await this.transport.retireCopyStatus(previous);
+    delete this.data.pairing;
+    this.clearBridgeState();
+    delete this.data.viewer;
+    // Live sync must not outlive its credentials (armed-by-proof invariant):
+    // tear the stream down with the pairing, not a tick later.
+    this.transport.shutdown();
+    // The account key is scoped to the pairing's account: forget it too, so
+    // a re-pair to a different account never decrypts with the wrong key.
+    await this.agenda.forgetKey();
+    await this.saveData(this.data);
+    this.transport.recordOwnSeq(await publishPairingMeta(null, previous).catch(() => null));
+    await this.writeHeartbeat();
+    new Notice('dayGLANCE bridge: unpaired. Also revoke the device token on your GLANCEvault server. Unpairing only forgets the local credentials.');
+  }
+
+  // ── Bridge bookkeeping: per copy where the platform allows (localState.ts) ──
+  private bridgeState(): BridgeState {
+    if (!this.localStore.available) return this.data.bridge ?? { appliedIds: [], hwm: 0 };
+    return joinBridgeState(this.local.bridge, this.data.bridgeConfig);
+  }
+
+  /** The per-copy half goes to device-local storage; data.json is written
+   *  only when the shared config cache's VALUE changed. */
+  private async saveBridgeState(state: BridgeState): Promise<void> {
+    if (!this.localStore.available) {
+      this.data.bridge = state;
+      await this.saveData(this.data);
+      return;
+    }
+    const { local, config } = splitBridgeState(state);
+    this.local.bridge = local;
+    this.localStore.save(this.local);
+    if (config !== undefined && JSON.stringify(config ?? null) !== JSON.stringify(this.data.bridgeConfig ?? null)) {
+      this.data.bridgeConfig = config;
+      await this.saveData(this.data);
+    }
+  }
+
+  /** A re-pair starts the stream clean (the caller saves data.json). */
+  private resetBridgeState(): void {
+    delete this.data.bridgeConfig;
+    if (!this.localStore.available) { this.data.bridge = { appliedIds: [], hwm: 0 }; return; }
+    this.local.bridge = { appliedIds: [], hwm: 0 };
+    this.localStore.save(this.local);
+  }
+
+  /** Unpair forgets the bookkeeping everywhere (the caller saves data.json). */
+  private clearBridgeState(): void {
+    delete this.data.bridge;
+    delete this.data.bridgeConfig;
+    if (!this.localStore.available) return;
+    delete this.local.bridge;
+    this.localStore.save(this.local);
+  }
+
+  // The active vault task scope, or null when none is configured.
+  private editorHiding(): EditorHidingSettings {
+    return normalizeEditorHidingSettings(this.data.editorHiding);
+  }
+
+  private scope(): VaultScope | null {
+    const s = this.data.scope ? normalizeScope(this.data.scope) : null;
+    return s && scopeIsActive(s) ? s : null;
+  }
+
+  // Explicit choice wins; else the pairing device's user; else everyone.
+  private viewer(): string | null {
+    if (this.data.viewer) return this.data.viewer.userSyncId;
+    return this.data.pairing?.userSyncId ?? null;
+  }
+
+  // Reveal (or create, in the right sidebar) the agenda view, landing on
+  // today. One leaf: reuse an existing one rather than stacking copies.
+  private async openAgenda(): Promise<void> {
+    const existing = this.app.workspace.getLeavesOfType(AGENDA_VIEW_TYPE)[0];
+    const leaf = existing ?? this.app.workspace.getRightLeaf(false);
+    if (!leaf) return;
+    if (!existing) await leaf.setViewState({ type: AGENDA_VIEW_TYPE, active: true });
+    void this.app.workspace.revealLeaf(leaf);
+    const view = leaf.view;
+    if (view instanceof AgendaView) view.showDate(localDateStr(new Date()));
+  }
+
+  private async writeHeartbeat(): Promise<void> {
+    try {
+      const adapter = this.app.vault.adapter;
+      const dir = normalizePath(HEARTBEAT_DIR);
+      if (!(await adapter.exists(dir))) {
+        await adapter.mkdir(dir);
+      }
+      const payload = heartbeatPayload({
+        deviceId: this.deviceId,
+        paired: !!this.data.pairing,
+        accountId: this.data.pairing?.accountId ?? null,
+        // Stamping diagnosability (2026-08-31 config-null incident): the beat
+        // carries the transport's normalize-then-observe arming tri-state so
+        // dayGLANCE's bridge status panel can SHOW a plugin stuck without its
+        // config row ('no-config' = daily-note reporting held, fail closed)
+        // instead of the state being invisible until fragments appear.
+        // Meaningful only while paired; readers gate on freshness+paired.
+        stamping: this.data.pairing ? this.transport.stampingState() : null,
+        // THE PAIRING SPLIT (2026-09-29): which pairing this copy holds, and
+        // whether the transport found it older than the vault's. dayGLANCE
+        // compares the generation with the meta:pairing row it seals under
+        // and says "re-pair this copy" instead of "active".
+        generation: this.data.pairing?.generation ?? null,
+        pairingStale: !!this.data.pairing && this.transport.pairingStale(),
+      });
+      await adapter.write(normalizePath(HEARTBEAT_PATH), JSON.stringify(payload));
+    } catch (e) {
+      // A liveness beacon must never nag: one console line, no Notice.
+      console.error('dayGLANCE bridge: heartbeat write failed', e);
+    }
+  }
+
+  // A sealed offer sitting in the vault means someone hit "Start pairing"
+  // in dayGLANCE — nudge toward the command, once. The contents can't be
+  // read without the code, but the envelope shape can: the cancelled form
+  // ('{}') and junk fail the v-check and don't nudge.
+  private async checkForPairingOffer(): Promise<void> {
+    try {
+      const text = await readPairingOfferText(this.app);
+      let sealed = false;
+      try { sealed = text !== null && (JSON.parse(text) as { v?: number } | null)?.v === 1; }
+      catch { /* not an offer envelope */ }
+      if (!sealed) {
+        this.offerNoticed = false;
+        return;
+      }
+      if (this.offerNoticed) return;
+      this.offerNoticed = true;
+      new Notice('dayGLANCE bridge: pairing offer found. Enter the code in Settings → dayGLANCE Bridge.');
+    } catch {
+      /* a nudge must never surface errors */
+    }
+  }
+}
